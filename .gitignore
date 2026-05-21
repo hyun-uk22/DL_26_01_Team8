@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+*.log
+*.tmp
+
+# 데이터 및 데이터 전처리
+data_preprocess/
+dataset/
+dataset_split/
+dummy_data/
+
+data.yaml
+
+Agents.md
+
+# 가중치
+*.pt
+
+.python-version
+
+피트니스 자세 이미지_데이터 명명규칙.xlsx
