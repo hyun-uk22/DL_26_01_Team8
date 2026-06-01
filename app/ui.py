@@ -252,6 +252,11 @@ class PoseCoachApp:
         self.user_preview_after_id: str | None = None
         self.preview_debounce_ms = 180
         self.selection_playback_generation = 0
+        self.video_controls_visible = True
+        self.video_controls_y = -2
+        self.video_controls_hide_after_id: str | None = None
+        self.video_controls_animation_after_id: str | None = None
+        self.video_controls_hide_delay_ms = 1800
 
         self._build_ui()
 
@@ -265,6 +270,8 @@ class PoseCoachApp:
         muted = "#94a3b8"
         accent = "#38bdf8"
         border = "#243247"
+        video_controls_bg = "#020617"
+        video_controls_active_bg = "#0f172a"
 
         style = ttk.Style()
         style.theme_use("clam")
@@ -445,6 +452,7 @@ class PoseCoachApp:
         self.video_area.pack(fill=tk.BOTH, expand=True)
         self.video_area.pack_propagate(False)
         self.video_area.bind("<Configure>", self._on_video_area_resize)
+        self.video_area.bind("<Motion>", self._on_video_area_motion)
 
         self.canvas = tk.Label(
             self.video_area,
@@ -452,19 +460,21 @@ class PoseCoachApp:
             cursor="crosshair",
         )
         self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.canvas.bind("<Motion>", self._on_video_area_motion)
         self.canvas.bind("<ButtonPress-1>", self._on_roi_start)
+        self.canvas.bind("<B1-Motion>", self._on_roi_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_roi_end)
 
-        self.analysis_controls = tk.Frame(self.video_area, bg="#111827")
+        self.analysis_controls = tk.Frame(self.video_area, bg=video_controls_bg)
         self.analysis_controls.place(relx=0.0, rely=1.0, relwidth=1.0, y=-2, anchor="sw")
         self.btn_video_play = tk.Button(
             self.analysis_controls,
             text="▶",
             command=self._play_video_from_controls,
             state=tk.NORMAL,
-            bg="#111827",
+            bg=video_controls_bg,
             fg="#f8fafc",
-            activebackground="#1f2937",
+            activebackground=video_controls_active_bg,
             activeforeground="#f8fafc",
             disabledforeground="#64748b",
             bd=0,
@@ -477,7 +487,7 @@ class PoseCoachApp:
         self.analysis_seek_bar = SeekBar(
             self.analysis_controls,
             command=self._seek_playback,
-            bg="#111827",
+            bg=video_controls_bg,
             track_bg="#64748b",
             active_bg="#0ea5e9",
             thumb_bg="#f8fafc",
@@ -486,12 +496,14 @@ class PoseCoachApp:
         self.analysis_time_label = tk.Label(
             self.analysis_controls,
             text="0:00 / 0:00",
-            bg="#111827",
+            bg=video_controls_bg,
             fg="#e5e7eb",
             font=("Malgun Gothic", 9),
             width=12,
         )
         self.analysis_time_label.pack(side=tk.LEFT, padx=(0, 12), pady=(4, 8))
+        self._bind_video_controls_motion()
+        self.root.after(self.video_controls_hide_delay_ms, self._hide_video_controls)
 
         timeline = tk.Frame(
             right,
@@ -626,6 +638,7 @@ class PoseCoachApp:
             self._show_preview_frame(frame)
 
     def _on_slider_change(self, *_, update_preview: bool = True):
+        was_playing_reference = self.is_playing_reference_preview and self.playback_target == "reference"
         self.playback_target = "reference"
         s = self.crop_start_var.get()
         e = self.crop_end_var.get()
@@ -635,6 +648,9 @@ class PoseCoachApp:
         self.crop_label.config(
             text=f"구간: {self._format_frame_time(self.loader, s)} ~ {self._format_frame_time(self.loader, e)}"
         )
+        if was_playing_reference:
+            self._restart_reference_preview_from_range(s, e)
+            return
         if update_preview and self.analysis_playback_frames:
             self.analysis_playback_frames = []
             self._reset_analysis_playback()
@@ -644,6 +660,26 @@ class PoseCoachApp:
             self._sync_selection_seek_ui()
         if update_preview:
             self._schedule_preview_update(s)
+
+    def _restart_reference_preview_from_range(self, start_frame: int, end_frame: int):
+        if self.loader.container is None or end_frame <= start_frame:
+            return
+
+        self.selection_playback_generation += 1
+        generation = self.selection_playback_generation
+        self.selection_playhead_frame = start_frame
+        self._sync_selection_seek_ui()
+        self._clear_frame_queue()
+        self.btn_video_play.config(text="■", state=tk.NORMAL)
+        self.info_bar.config(
+            text=f"레퍼런스 선택 구간 재생 중 | "
+                 f"{self._format_frame_time(self.loader, start_frame)} ~ {self._format_frame_time(self.loader, end_frame)}"
+        )
+        threading.Thread(
+            target=self._play_selection_video_worker,
+            args=(self.loader, start_frame, end_frame, True, generation),
+            daemon=True,
+        ).start()
 
     def _schedule_preview_update(self, frame_idx: int):
         if self.preview_after_id is not None:
@@ -760,7 +796,11 @@ class PoseCoachApp:
             messagebox.showwarning("녹화 중", "녹화를 종료한 뒤 레퍼런스 포즈를 추출하세요.")
             return
         if self.is_playing_reference_preview:
-            messagebox.showwarning("재생 중", "레퍼런스 구간 재생을 중지한 뒤 포즈를 추출하세요.")
+            self.is_playing_reference_preview = False
+            self.selection_playback_generation += 1
+            self.btn_video_play.config(text="▶", state=tk.NORMAL)
+            self._clear_frame_queue()
+        if not self._validate_reference_roi_for_pose_extraction():
             return
 
         start_f = self.crop_start_var.get()
@@ -805,6 +845,32 @@ class PoseCoachApp:
         self.info_bar.config(
             text=f"레퍼런스 포즈 {len(self.ref_poses)}개 추출 완료. 실시간 분석을 시작하세요."
         )
+
+    def _validate_reference_roi_for_pose_extraction(self) -> bool:
+        if self.preview_frame is None:
+            return True
+
+        target_frame = self._crop_frame_to_roi(self.preview_frame)
+        person_count = self.detector.count_people(target_frame)
+
+        if person_count <= 1:
+            return True
+
+        if self.crop_roi is None:
+            messagebox.showwarning(
+                "여러 사람 감지",
+                "레퍼런스 영상에서 여러 사람이 감지되었습니다.\n"
+                "원하는 사람만 포함되도록 영상 위에서 드래그해 영역을 선택한 뒤 포즈를 추출하세요.",
+            )
+            self.info_bar.config(text="여러 사람 감지: 원하는 사람만 ROI crop으로 선택하세요.")
+        else:
+            messagebox.showwarning(
+                "영역 재선택 필요",
+                "선택한 crop 영역 안에 아직 여러 사람이 감지되었습니다.\n"
+                "분석할 사람 한 명만 들어오도록 영역을 더 좁게 선택하세요.",
+            )
+            self.info_bar.config(text="ROI 안에 여러 사람 감지: 영역을 더 좁게 선택하세요.")
+        return False
 
     def _start_live(self):
         if not self.ref_poses:
@@ -1472,6 +1538,65 @@ class PoseCoachApp:
 
     def _on_video_area_resize(self, event):
         self.video_area_size = (max(1, event.width), max(1, event.height))
+        self._place_video_controls(self.video_controls_y)
+
+    def _bind_video_controls_motion(self):
+        widgets = (
+            self.analysis_controls,
+            self.btn_video_play,
+            self.analysis_seek_bar,
+            self.analysis_time_label,
+        )
+        for widget in widgets:
+            widget.bind("<Motion>", self._on_video_area_motion, add="+")
+            widget.bind("<ButtonPress-1>", self._on_video_area_motion, add="+")
+
+    def _on_video_area_motion(self, _event=None):
+        self._show_video_controls()
+        self._schedule_video_controls_hide()
+
+    def _schedule_video_controls_hide(self):
+        if self.video_controls_hide_after_id is not None:
+            self.root.after_cancel(self.video_controls_hide_after_id)
+        self.video_controls_hide_after_id = self.root.after(
+            self.video_controls_hide_delay_ms,
+            self._hide_video_controls,
+        )
+
+    def _show_video_controls(self):
+        self.video_controls_visible = True
+        self._animate_video_controls(-2)
+
+    def _hide_video_controls(self):
+        self.video_controls_hide_after_id = None
+        self.video_controls_visible = False
+        self._animate_video_controls(self._hidden_video_controls_y())
+
+    def _hidden_video_controls_y(self) -> int:
+        return max(40, self.analysis_controls.winfo_reqheight() + 8)
+
+    def _animate_video_controls(self, target_y: int):
+        if self.video_controls_animation_after_id is not None:
+            self.root.after_cancel(self.video_controls_animation_after_id)
+            self.video_controls_animation_after_id = None
+
+        current_y = self.video_controls_y
+        if current_y == target_y:
+            self._place_video_controls(target_y)
+            return
+
+        direction = 1 if target_y > current_y else -1
+        next_y = current_y + direction * min(8, abs(target_y - current_y))
+        self._place_video_controls(next_y)
+        self.video_controls_animation_after_id = self.root.after(
+            12,
+            self._animate_video_controls,
+            target_y,
+        )
+
+    def _place_video_controls(self, y: int):
+        self.video_controls_y = y
+        self.analysis_controls.place(relx=0.0, rely=1.0, relwidth=1.0, y=y, anchor="sw")
 
     def _update_canvas(self):
         """Tkinter 메인 루프에서 주기적으로 캔버스 갱신."""
@@ -1505,11 +1630,17 @@ class PoseCoachApp:
         self.canvas.config(image=photo)
         self.canvas.image = photo  # 참조 유지
 
-    def _show_preview_frame(self, frame: np.ndarray):
+    def _show_preview_frame(self, frame: np.ndarray, drag_box: tuple[int, int, int, int] | None = None):
         self.preview_frame = frame.copy()
         display = frame.copy()
         if self.crop_roi is not None:
             x1, y1, x2, y2 = self._roi_to_pixels(display, self.crop_roi)
+            cv2.rectangle(display, (x1, y1), (x2, y2), (0, 220, 255), 2)
+        if drag_box is not None:
+            x1, y1, x2, y2 = drag_box
+            overlay = display.copy()
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 220, 255), -1)
+            cv2.addWeighted(overlay, 0.18, display, 0.82, 0, display)
             cv2.rectangle(display, (x1, y1), (x2, y2), (0, 220, 255), 2)
         self._show_frame(display)
 
@@ -1522,26 +1653,54 @@ class PoseCoachApp:
     def _on_roi_start(self, event):
         if self.preview_frame is None or self.is_running or self.is_recording or self.is_playing_analysis:
             return
-        self.drag_start = (event.x, event.y)
+        canvas_x, canvas_y = self._event_to_canvas_point(event)
+        if self._canvas_to_frame_point(canvas_x, canvas_y) is None:
+            return
+        self.drag_start = (canvas_x, canvas_y)
+        self.canvas.bind_all("<B1-Motion>", self._on_roi_drag, add="+")
+        self.canvas.bind_all("<ButtonRelease-1>", self._on_roi_end, add="+")
+        self.info_bar.config(text="ROI 영역 선택 중...")
+
+    def _on_roi_drag(self, event):
+        if self.preview_frame is None or self.drag_start is None or self.is_running or self.is_recording or self.is_playing_analysis:
+            return
+
+        canvas_x, canvas_y = self._event_to_canvas_point(event)
+        start = self._canvas_to_frame_point(*self.drag_start)
+        end = self._canvas_to_frame_point(canvas_x, canvas_y, clamp=True)
+        if start is None or end is None:
+            return
+
+        x1, x2 = sorted((start[0], end[0]))
+        y1, y2 = sorted((start[1], end[1]))
+        self._show_preview_frame(self.preview_frame, (x1, y1, x2, y2))
 
     def _on_roi_end(self, event):
         if self.preview_frame is None or self.drag_start is None or self.is_running or self.is_recording or self.is_playing_analysis:
             return
 
+        canvas_x, canvas_y = self._event_to_canvas_point(event)
         start = self._canvas_to_frame_point(*self.drag_start)
-        end = self._canvas_to_frame_point(event.x, event.y)
+        end = self._canvas_to_frame_point(canvas_x, canvas_y, clamp=True)
+        self.canvas.unbind_all("<B1-Motion>")
+        self.canvas.unbind_all("<ButtonRelease-1>")
         self.drag_start = None
         if start is None or end is None:
+            self._show_preview_frame(self.preview_frame)
             return
 
         h, w = self.preview_frame.shape[:2]
         x1, x2 = sorted((start[0], end[0]))
         y1, y2 = sorted((start[1], end[1]))
         if (x2 - x1) < 20 or (y2 - y1) < 20:
+            self._show_preview_frame(self.preview_frame)
+            self.info_bar.config(text="ROI 영역이 너무 작습니다. 분석할 사람 전체가 들어오도록 다시 드래그하세요.")
             return
 
         self.crop_roi = (x1 / w, y1 / h, x2 / w, y2 / h)
-        self.info_bar.config(text="영역 crop 설정 완료. 구간 확정 & 포즈 추출을 누르세요.")
+        self.info_bar.config(
+            text=f"ROI crop 설정 완료: ({x1}, {y1})~({x2}, {y2}). 포즈 추출을 누르세요."
+        )
         self._show_preview_frame(self.preview_frame)
 
     def _reset_roi(self):
@@ -1550,7 +1709,7 @@ class PoseCoachApp:
             self._show_preview_frame(self.preview_frame)
         self.info_bar.config(text="영역 crop이 초기화되었습니다.")
 
-    def _canvas_to_frame_point(self, x: int, y: int) -> tuple[int, int] | None:
+    def _canvas_to_frame_point(self, x: int, y: int, clamp: bool = False) -> tuple[int, int] | None:
         if self.preview_frame is None:
             return None
 
@@ -1558,13 +1717,19 @@ class PoseCoachApp:
         dw, dh = self.display_size
         if dw <= 0 or dh <= 0:
             return None
-        if x < ox or y < oy or x > ox + dw or y > oy + dh:
+        if clamp:
+            x = max(ox, min(ox + dw, x))
+            y = max(oy, min(oy + dh, y))
+        elif x < ox or y < oy or x > ox + dw or y > oy + dh:
             return None
 
         h, w = self.preview_frame.shape[:2]
         fx = int((x - ox) * w / dw)
         fy = int((y - oy) * h / dh)
         return max(0, min(w - 1, fx)), max(0, min(h - 1, fy))
+
+    def _event_to_canvas_point(self, event) -> tuple[int, int]:
+        return event.x_root - self.canvas.winfo_rootx(), event.y_root - self.canvas.winfo_rooty()
 
     def _crop_frame_to_roi(self, frame: np.ndarray) -> np.ndarray:
         if self.crop_roi is None:

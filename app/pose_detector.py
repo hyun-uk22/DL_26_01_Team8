@@ -31,6 +31,17 @@ class PoseDetector:
         """YOLO Pose 모델 로드 (없으면 자동 다운로드)"""
         self.model = YOLO(model_path)
 
+    def count_people(self, frame: np.ndarray) -> int:
+        """프레임에서 감지된 사람 수를 반환합니다."""
+        results = self.model(frame, verbose=False)
+        if not results or results[0].keypoints is None:
+            return 0
+
+        kp_data = results[0].keypoints
+        if kp_data.xy is None:
+            return 0
+        return len(kp_data.xy)
+
     def detect(self, frame: np.ndarray) -> dict | None:
         """
         프레임에서 포즈를 감지합니다.
