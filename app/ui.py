@@ -240,17 +240,18 @@ class PoseCoachApp:
         self.user_crop_start_var = tk.IntVar(value=0)
         self.user_crop_end_var = tk.IntVar(value=0)
         self.crop_roi: tuple[float, float, float, float] | None = None
+        self.crop_roi_history: list[tuple[float, float, float, float] | None] = []
         self.drag_start: tuple[int, int] | None = None
         self.preview_frame: np.ndarray | None = None
         self.display_origin = (0, 0)
         self.display_size = (0, 0)
         self.video_area_size = (960, 540)
-        self.ref_sample_step = 5
+        self.ref_sample_step = 2  # 빠른 동작(점프 등) 감지를 위해 샘플링 증가
         self.ref_playback_fps = 6.0
         self.last_ref_advance = 0.0
         self.preview_after_id: str | None = None
         self.user_preview_after_id: str | None = None
-        self.preview_debounce_ms = 180
+        self.preview_debounce_ms = 50
         self.selection_playback_generation = 0
         self.video_controls_visible = True
         self.video_controls_y = -2
@@ -261,6 +262,27 @@ class PoseCoachApp:
         self._build_ui()
 
     # ── UI 구성 ────────────────────────────────────────────
+
+    def _disable_buttons_recursive(self, widget):
+        """모든 버튼을 재귀적으로 비활성화"""
+        if isinstance(widget, (ttk.Button, tk.Button)):
+            widget.config(state=tk.DISABLED)
+        for child in widget.winfo_children():
+            self._disable_buttons_recursive(child)
+
+    def _enable_buttons_recursive(self, widget):
+        """모든 버튼을 재귀적으로 활성화 (특정 버튼은 상태에 따라 제외)"""
+        if isinstance(widget, (ttk.Button, tk.Button)):
+            # 실행 중 상태에 따라 일부 버튼만 활성화
+            if widget == self.btn_stop and not self.is_running:
+                return
+            if widget == self.btn_record_stop and not self.is_recording:
+                return
+            if widget == self.btn_record_analyze and self.user_loader.container is None:
+                return
+            widget.config(state=tk.NORMAL)
+        for child in widget.winfo_children():
+            self._enable_buttons_recursive(child)
 
     def _build_ui(self):
         bg = "#0b1120"
@@ -495,13 +517,14 @@ class PoseCoachApp:
         self.analysis_seek_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 10), pady=(4, 8))
         self.analysis_time_label = tk.Label(
             self.analysis_controls,
-            text="0:00 / 0:00",
+            text="0:00.00 / 0:00.00",
             bg=video_controls_bg,
             fg="#e5e7eb",
             font=("Malgun Gothic", 9),
-            width=12,
+            width=18,
+            anchor="e",
         )
-        self.analysis_time_label.pack(side=tk.LEFT, padx=(0, 12), pady=(4, 8))
+        self.analysis_time_label.pack(side=tk.LEFT, padx=(6, 12), pady=(4, 8))
         self._bind_video_controls_motion()
         self.root.after(self.video_controls_hide_delay_ms, self._hide_video_controls)
 
@@ -527,15 +550,20 @@ class PoseCoachApp:
         )
         self.range_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=10)
 
-        self.crop_label = tk.Label(
-            timeline,
-            text="구간: -",
-            bg="#111827",
-            fg=text,
-            font=("Malgun Gothic", 10, "bold"),
-            width=24,
-        )
-        self.crop_label.pack(side=tk.LEFT, padx=(8, 6), pady=10)
+        time_input_frame = tk.Frame(timeline, bg="#111827")
+        time_input_frame.pack(side=tk.LEFT, padx=(8, 6), pady=10)
+
+        tk.Label(time_input_frame, text="시작:", bg="#111827", fg=muted,
+                 font=("Malgun Gothic", 8)).grid(row=0, column=0, sticky="e", padx=(0, 2))
+        self.crop_start_entry = ttk.Entry(time_input_frame, width=8, font=("Malgun Gothic", 9))
+        self.crop_start_entry.grid(row=0, column=1, padx=2)
+        self.crop_start_entry.bind("<Return>", self._on_time_entry_change)
+
+        tk.Label(time_input_frame, text="끝:", bg="#111827", fg=muted,
+                 font=("Malgun Gothic", 8)).grid(row=1, column=0, sticky="e", padx=(0, 2))
+        self.crop_end_entry = ttk.Entry(time_input_frame, width=8, font=("Malgun Gothic", 9))
+        self.crop_end_entry.grid(row=1, column=1, padx=2)
+        self.crop_end_entry.bind("<Return>", self._on_time_entry_change)
 
         ttk.Button(
             timeline,
@@ -545,8 +573,10 @@ class PoseCoachApp:
             width=9,
         ).pack(side=tk.LEFT, padx=(0, 4), pady=8)
         ttk.Button(timeline, text="영역 초기화", command=self._reset_roi, width=10).pack(
-            side=tk.LEFT, padx=(0, 8), pady=8
+            side=tk.LEFT, padx=(0, 4), pady=8
         )
+        self.btn_roi_undo = ttk.Button(timeline, text="↶ 되돌리기", command=self._undo_roi, width=10, state=tk.DISABLED)
+        self.btn_roi_undo.pack(side=tk.LEFT, padx=(0, 8), pady=8)
 
         user_timeline = tk.Frame(
             right,
@@ -637,6 +667,43 @@ class PoseCoachApp:
         if frame is not None:
             self._show_preview_frame(frame)
 
+    def _on_time_entry_change(self, event=None):
+        """시간 입력 필드에서 엔터 입력 시 슬라이더 업데이트"""
+        try:
+            start_text = self.crop_start_entry.get().strip()
+            end_text = self.crop_end_entry.get().strip()
+
+            if start_text:
+                start_seconds = self._parse_time_input(start_text)
+                start_frame = int(start_seconds * max(self.loader.fps, 1.0))
+                self.crop_start_var.set(max(0, min(start_frame, self._loader_total_frames(self.loader) - 1)))
+
+            if end_text:
+                end_seconds = self._parse_time_input(end_text)
+                end_frame = int(end_seconds * max(self.loader.fps, 1.0))
+                self.crop_end_var.set(max(1, min(end_frame, self._loader_total_frames(self.loader))))
+
+            self._on_slider_change(update_preview=True)
+        except ValueError as e:
+            messagebox.showwarning("입력 오류", f"시간 형식이 잘못되었습니다.\n예: 1:30 또는 90\n오류: {e}")
+
+    @staticmethod
+    def _parse_time_input(text: str) -> float:
+        """시간 문자열을 초 단위로 변환 (예: '1:30.5' -> 90.5, '45' -> 45.0)"""
+        text = text.strip()
+        if ':' in text:
+            parts = text.split(':')
+            if len(parts) == 2:
+                minutes = float(parts[0])
+                seconds = float(parts[1])
+                return minutes * 60 + seconds
+            elif len(parts) == 3:
+                hours = float(parts[0])
+                minutes = float(parts[1])
+                seconds = float(parts[2])
+                return hours * 3600 + minutes * 60 + seconds
+        return float(text)
+
     def _on_slider_change(self, *_, update_preview: bool = True):
         was_playing_reference = self.is_playing_reference_preview and self.playback_target == "reference"
         self.playback_target = "reference"
@@ -645,9 +712,12 @@ class PoseCoachApp:
         if e <= s:
             self.crop_end_var.set(s + 1)
             e = s + 1
-        self.crop_label.config(
-            text=f"구간: {self._format_frame_time(self.loader, s)} ~ {self._format_frame_time(self.loader, e)}"
-        )
+
+        # Entry 필드 업데이트
+        self.crop_start_entry.delete(0, tk.END)
+        self.crop_start_entry.insert(0, self._format_frame_time(self.loader, s))
+        self.crop_end_entry.delete(0, tk.END)
+        self.crop_end_entry.insert(0, self._format_frame_time(self.loader, e))
         if was_playing_reference:
             self._restart_reference_preview_from_range(s, e)
             return
@@ -808,6 +878,11 @@ class PoseCoachApp:
 
         self.ref_frames.clear()
         self.ref_poses.clear()
+
+        # 버튼 비활성화로 중복 실행 방지
+        for widget in self.root.winfo_children():
+            self._disable_buttons_recursive(widget)
+
         self.info_bar.config(text="포즈 추출 중... (잠시 기다려 주세요)")
         self.root.update()
 
@@ -833,6 +908,10 @@ class PoseCoachApp:
         self.root.after(0, self._finish_ref_pose_extraction, ref_frames, ref_poses)
 
     def _finish_ref_pose_extraction(self, ref_frames: list[np.ndarray], ref_poses: list[dict]):
+        # 버튼 재활성화
+        for widget in self.root.winfo_children():
+            self._enable_buttons_recursive(widget)
+
         if not ref_poses:
             messagebox.showwarning("감지 실패", "해당 구간에서 포즈를 감지하지 못했습니다.")
             self.info_bar.config(text="포즈 감지 실패")
@@ -1250,11 +1329,16 @@ class PoseCoachApp:
 
         start_f = self.user_crop_start_var.get()
         end_f = self.user_crop_end_var.get()
-        self.btn_record_analyze.config(state=tk.DISABLED)
-        self.btn_video_play.config(state=tk.DISABLED)
+
+        # 버튼 비활성화로 중복 실행 방지
+        for widget in self.root.winfo_children():
+            self._disable_buttons_recursive(widget)
+
         self.analysis_playback_frames = []
         self._reset_analysis_playback()
-        self.info_bar.config(text="녹화 구간 분석 중...")
+        self.info_bar.config(text="녹화 구간 분석 중... (시간이 걸릴 수 있습니다)")
+        self.root.update()
+
         threading.Thread(
             target=self._analyze_recorded_video_worker,
             args=(start_f, end_f),
@@ -1265,10 +1349,22 @@ class PoseCoachApp:
         user_frames = []
         user_poses = []
         sample_step = max(1, int(round(self.user_loader.fps / self.ref_playback_fps)))
+        total_frames = end_f - start_f
 
+        # 1단계: 포즈 추출
         for i, frame in enumerate(self.user_loader.get_frame_range(start_f, end_f)):
             if i % sample_step != 0:
                 continue
+
+            # 진행률 업데이트
+            if i % (sample_step * 5) == 0:  # 5프레임마다 업데이트
+                self.root.after(
+                    0,
+                    lambda idx=i: self.info_bar.config(
+                        text=f"1단계: 포즈 추출 중... {idx}/{total_frames} 프레임"
+                    )
+                )
+
             pose = self.detector.detect(frame)
             if pose is not None:
                 user_frames.append(frame.copy())
@@ -1278,6 +1374,8 @@ class PoseCoachApp:
             self.root.after(0, self._finish_recorded_analysis, None, None, None, [])
             return
 
+        # 2단계: DTW 매칭
+        self.root.after(0, lambda: self.info_bar.config(text="2단계: 동작 정렬 중... (DTW)"))
         ref_poses, ref_frames, repeat_count = self._repeat_reference_for_analysis(len(user_poses))
         scores = []
         last_display = None
@@ -1287,7 +1385,17 @@ class PoseCoachApp:
             self.root.after(0, self._finish_recorded_analysis, None, None, None, [])
             return
 
-        for ref_idx, user_idx in dtw_path:
+        # 3단계: 유사도 계산 및 시각화
+        total_pairs = len(dtw_path)
+        for pair_idx, (ref_idx, user_idx) in enumerate(dtw_path):
+            # 진행률 업데이트
+            if pair_idx % 5 == 0:
+                self.root.after(
+                    0,
+                    lambda idx=pair_idx: self.info_bar.config(
+                        text=f"3단계: 유사도 계산 중... {idx}/{total_pairs} 쌍"
+                    )
+                )
             sim = self.similarity_calc.compute(ref_poses[ref_idx], user_poses[user_idx])
             scores.append(sim["overall"])
             user_display = self.visualizer.draw_pose(
@@ -1310,10 +1418,21 @@ class PoseCoachApp:
             playback_frames.append(last_display)
 
         avg_score = float(np.mean(scores)) if scores else 0.0
+        min_score = float(np.min(scores)) if scores else 0.0
+        max_score = float(np.max(scores)) if scores else 0.0
+
+        # 나쁜 구간 찾기 (유사도 70% 미만)
+        bad_indices = [i for i, s in enumerate(scores) if s < 0.70]
+        bad_count = len(bad_indices)
+
         self.root.after(
             0,
             self._finish_recorded_analysis,
             avg_score,
+            min_score,
+            max_score,
+            bad_count,
+            total_pairs,
             f"{len(dtw_path)} / ref x{repeat_count}",
             last_display,
             playback_frames,
@@ -1332,22 +1451,35 @@ class PoseCoachApp:
     def _finish_recorded_analysis(
         self,
         avg_score: float | None,
+        min_score: float | None,
+        max_score: float | None,
+        bad_count: int | None,
+        total_count: int | None,
         pair_count: int | str | None,
         display_frame: np.ndarray | None,
         playback_frames: list[np.ndarray],
     ):
-        self.btn_record_analyze.config(state=tk.NORMAL)
+        # 버튼 재활성화
+        for widget in self.root.winfo_children():
+            self._enable_buttons_recursive(widget)
+
         if avg_score is None or pair_count is None:
             messagebox.showwarning("감지 실패", "녹화 구간에서 포즈를 감지하지 못했습니다.")
             self.info_bar.config(text="녹화 구간 포즈 감지 실패")
-            self.btn_video_play.config(text="▶", state=tk.NORMAL)
             return
         self._set_analysis_playback_frames(playback_frames)
         if self.analysis_playback_frames:
             self.playback_target = "analysis"
-            self.btn_video_play.config(state=tk.NORMAL)
         self._update_sim_ui(avg_score)
-        self.info_bar.config(text=f"녹화 구간 분석 완료 | 비교 {pair_count} | 평균 유사도 {avg_score*100:.1f}%")
+
+        # 상세 정보 표시
+        info_text = (
+            f"분석 완료 | 평균: {avg_score*100:.1f}% | "
+            f"최소: {min_score*100:.1f}% | 최대: {max_score*100:.1f}% | "
+            f"교정 필요: {bad_count}/{total_count} 구간"
+        )
+        self.info_bar.config(text=info_text)
+
         if display_frame is not None:
             self._show_frame(display_frame)
 
@@ -1433,6 +1565,8 @@ class PoseCoachApp:
             return
 
         ref_pose = self._get_ref_pose()
+        frame_count = 0
+        last_process_time = time.monotonic()
 
         while self.is_running:
             ret, frame = cap.read()
@@ -1440,6 +1574,20 @@ class PoseCoachApp:
                 break
             frame = cv2.flip(frame, 1)  # 좌우 반전 (거울 모드)
 
+            frame_count += 1
+            current_time = time.monotonic()
+
+            # 프레임 스킵: 처리 시간이 오래 걸리면 2프레임마다 처리
+            process_interval = current_time - last_process_time
+            skip_frame = (process_interval < 0.1 and frame_count % 2 == 0)
+
+            if skip_frame:
+                # 프레임 스킵 - 이전 결과 재사용
+                if not self.frame_queue.full():
+                    self.frame_queue.put(frame)
+                continue
+
+            last_process_time = current_time
             user_pose = self.detector.detect(frame)
 
             if user_pose is not None and ref_pose is not None:
@@ -1697,17 +1845,45 @@ class PoseCoachApp:
             self.info_bar.config(text="ROI 영역이 너무 작습니다. 분석할 사람 전체가 들어오도록 다시 드래그하세요.")
             return
 
+        # 이전 ROI를 히스토리에 저장
+        self.crop_roi_history.append(self.crop_roi)
+        if len(self.crop_roi_history) > 10:  # 최대 10개까지만 저장
+            self.crop_roi_history.pop(0)
+
         self.crop_roi = (x1 / w, y1 / h, x2 / w, y2 / h)
+        self.btn_roi_undo.config(state=tk.NORMAL)
         self.info_bar.config(
             text=f"ROI crop 설정 완료: ({x1}, {y1})~({x2}, {y2}). 포즈 추출을 누르세요."
         )
         self._show_preview_frame(self.preview_frame)
 
-    def _reset_roi(self):
-        self.crop_roi = None
+    def _undo_roi(self):
+        """ROI 설정을 이전 상태로 되돌림"""
+        if not self.crop_roi_history:
+            return
+
+        self.crop_roi = self.crop_roi_history.pop()
+        if not self.crop_roi_history:
+            self.btn_roi_undo.config(state=tk.DISABLED)
+
         if self.preview_frame is not None:
             self._show_preview_frame(self.preview_frame)
-        self.info_bar.config(text="영역 crop이 초기화되었습니다.")
+        self.info_bar.config(text="ROI가 이전 상태로 되돌려졌습니다.")
+
+    def _reset_roi(self):
+        if self.crop_roi is not None:
+            # ROI가 설정되어 있는 경우: 히스토리에 저장
+            self.crop_roi_history.append(self.crop_roi)
+            if len(self.crop_roi_history) > 10:
+                self.crop_roi_history.pop(0)
+            self.btn_roi_undo.config(state=tk.NORMAL)
+            self.crop_roi = None
+            if self.preview_frame is not None:
+                self._show_preview_frame(self.preview_frame)
+            self.info_bar.config(text="영역 crop이 초기화되었습니다.")
+        else:
+            # ROI가 없는 경우: 이미 초기화된 상태
+            self.info_bar.config(text="설정된 영역이 없습니다. 영상 위에서 드래그하여 영역을 선택하세요.")
 
     def _canvas_to_frame_point(self, x: int, y: int, clamp: bool = False) -> tuple[int, int] | None:
         if self.preview_frame is None:
