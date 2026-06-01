@@ -808,6 +808,7 @@ class PoseCoachApp:
 
         self.ref_frames.clear()
         self.ref_poses.clear()
+        self.detector.reset_filter("reference")
         self.info_bar.config(text="포즈 추출 중... (잠시 기다려 주세요)")
         self.root.update()
 
@@ -825,7 +826,8 @@ class PoseCoachApp:
             if i % self.ref_sample_step != 0:
                 continue
             frame = self._crop_frame_to_roi(frame)
-            pose = self.detector.detect(frame)
+            timestamp = (start_f + i) / max(self.loader.fps, 1.0)
+            pose = self.detector.detect(frame, filter_stream="reference", timestamp=timestamp)
             if pose is not None:
                 ref_frames.append(frame.copy())
                 ref_poses.append(pose)
@@ -886,6 +888,7 @@ class PoseCoachApp:
         self.btn_start.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
         self.last_ref_advance = time.monotonic()
+        self.detector.reset_filter("live")
         threading.Thread(target=self._live_loop, daemon=True).start()
         self._update_canvas()
 
@@ -1265,11 +1268,13 @@ class PoseCoachApp:
         user_frames = []
         user_poses = []
         sample_step = max(1, int(round(self.user_loader.fps / self.ref_playback_fps)))
+        self.detector.reset_filter("recorded")
 
         for i, frame in enumerate(self.user_loader.get_frame_range(start_f, end_f)):
             if i % sample_step != 0:
                 continue
-            pose = self.detector.detect(frame)
+            timestamp = (start_f + i) / max(self.user_loader.fps, 1.0)
+            pose = self.detector.detect(frame, filter_stream="recorded", timestamp=timestamp)
             if pose is not None:
                 user_frames.append(frame.copy())
                 user_poses.append(pose)
@@ -1440,7 +1445,11 @@ class PoseCoachApp:
                 break
             frame = cv2.flip(frame, 1)  # 좌우 반전 (거울 모드)
 
-            user_pose = self.detector.detect(frame)
+            user_pose = self.detector.detect(
+                frame,
+                filter_stream="live",
+                timestamp=time.monotonic(),
+            )
 
             if user_pose is not None and ref_pose is not None:
                 sim = self.similarity_calc.compute(ref_pose, user_pose)
