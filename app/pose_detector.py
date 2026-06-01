@@ -3,6 +3,10 @@ from ultralytics import YOLO
 
 
 MIN_KEYPOINT_CONFIDENCE = 0.30
+EMA_ALPHA = 0.55
+ONE_EURO_MIN_CUTOFF = 1.0
+ONE_EURO_BETA = 0.35
+ONE_EURO_D_CUTOFF = 1.0
 
 # YOLO-Pose 17개 키포인트 이름 (COCO 순서)
 KEYPOINT_NAMES = [
@@ -30,6 +34,14 @@ class PoseDetector:
     def __init__(self, model_path: str = "yolo26x-pose.pt"):
         """YOLO Pose 모델 로드 (없으면 자동 다운로드)"""
         self.model = YOLO(model_path)
+        self._filter_states: dict[str, PoseSmoothingFilter] = {}
+
+    def reset_filter(self, stream_id: str | None = None):
+        """시퀀스가 바뀔 때 temporal smoothing 상태를 초기화합니다."""
+        if stream_id is None:
+            self._filter_states.clear()
+        else:
+            self._filter_states.pop(stream_id, None)
 
     def count_people(self, frame: np.ndarray) -> int:
         """프레임에서 감지된 사람 수를 반환합니다."""
@@ -42,7 +54,12 @@ class PoseDetector:
             return 0
         return len(kp_data.xy)
 
-    def detect(self, frame: np.ndarray) -> dict | None:
+    def detect(
+        self,
+        frame: np.ndarray,
+        filter_stream: str | None = None,
+        timestamp: float | None = None,
+    ) -> dict | None:
         """
         프레임에서 포즈를 감지합니다.
         반환: {
@@ -68,6 +85,8 @@ class PoseDetector:
         h, w = frame.shape[:2]
         xy_norm = xy / np.array([w, h])         # 정규화 (0~1)
         valid = conf >= MIN_KEYPOINT_CONFIDENCE
+        if filter_stream is not None:
+            xy_norm = self._smooth_keypoints(filter_stream, xy_norm, valid, timestamp)
 
         body_norm = self._normalize_body_keypoints(xy_norm, valid)
         angles = self._compute_angles(xy_norm, valid)
@@ -80,6 +99,19 @@ class PoseDetector:
             "valid": valid,
             "angles": angles,
         }
+
+    def _smooth_keypoints(
+        self,
+        stream_id: str,
+        keypoints: np.ndarray,
+        valid: np.ndarray,
+        timestamp: float | None,
+    ) -> np.ndarray:
+        state = self._filter_states.get(stream_id)
+        if state is None:
+            state = PoseSmoothingFilter()
+            self._filter_states[stream_id] = state
+        return state.apply(keypoints, valid, timestamp)
 
     def _compute_angles(self, kp: np.ndarray, valid: np.ndarray) -> dict:
         """관절 삼중쌍을 이용해 각도(0~180도)를 계산합니다."""
@@ -145,3 +177,102 @@ class PoseDetector:
         cos_theta = np.dot(va, vb) / (norm_a * norm_b)
         cos_theta = np.clip(cos_theta, -1.0, 1.0)
         return float(np.degrees(np.arccos(cos_theta)))
+
+
+class PoseSmoothingFilter:
+    """EMA 후 One Euro Filter를 이어 적용해 프레임 간 keypoint 떨림을 줄입니다."""
+
+    def __init__(
+        self,
+        ema_alpha: float = EMA_ALPHA,
+        min_cutoff: float = ONE_EURO_MIN_CUTOFF,
+        beta: float = ONE_EURO_BETA,
+        d_cutoff: float = ONE_EURO_D_CUTOFF,
+    ):
+        self.ema_alpha = ema_alpha
+        self.ema_values: np.ndarray | None = None
+        self.ema_valid: np.ndarray | None = None
+        self.filters = [
+            [OneEuroFilter(min_cutoff=min_cutoff, beta=beta, d_cutoff=d_cutoff) for _ in range(2)]
+            for _ in range(len(KEYPOINT_NAMES))
+        ]
+
+    def apply(self, keypoints: np.ndarray, valid: np.ndarray, timestamp: float | None) -> np.ndarray:
+        smoothed = keypoints.copy()
+        if self.ema_values is None:
+            self.ema_values = keypoints.copy()
+            self.ema_valid = valid.copy()
+        elif self.ema_valid is not None:
+            for idx, is_valid in enumerate(valid):
+                if not is_valid:
+                    continue
+                if not self.ema_valid[idx]:
+                    self.ema_values[idx] = keypoints[idx]
+                else:
+                    self.ema_values[idx] = (
+                        self.ema_alpha * keypoints[idx]
+                        + (1.0 - self.ema_alpha) * self.ema_values[idx]
+                    )
+                self.ema_valid[idx] = True
+
+        for kp_idx, is_valid in enumerate(valid):
+            if not is_valid:
+                continue
+            for axis in range(2):
+                smoothed[kp_idx, axis] = self.filters[kp_idx][axis].apply(
+                    float(self.ema_values[kp_idx, axis]),
+                    timestamp,
+                )
+        return smoothed
+
+
+class OneEuroFilter:
+    """속도가 빠를수록 덜 부드럽게 처리해 지연과 떨림을 함께 줄이는 low-pass filter."""
+
+    def __init__(
+        self,
+        min_cutoff: float = ONE_EURO_MIN_CUTOFF,
+        beta: float = ONE_EURO_BETA,
+        d_cutoff: float = ONE_EURO_D_CUTOFF,
+    ):
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.prev_value: float | None = None
+        self.prev_derivative = 0.0
+        self.prev_timestamp: float | None = None
+
+    def apply(self, value: float, timestamp: float | None) -> float:
+        if self.prev_value is None:
+            self.prev_value = value
+            self.prev_timestamp = timestamp
+            return value
+
+        dt = self._delta_time(timestamp)
+        derivative = (value - self.prev_value) / dt
+        derivative_alpha = self._alpha(dt, self.d_cutoff)
+        filtered_derivative = (
+            derivative_alpha * derivative
+            + (1.0 - derivative_alpha) * self.prev_derivative
+        )
+        cutoff = self.min_cutoff + self.beta * abs(filtered_derivative)
+        value_alpha = self._alpha(dt, cutoff)
+        filtered_value = value_alpha * value + (1.0 - value_alpha) * self.prev_value
+
+        self.prev_value = filtered_value
+        self.prev_derivative = filtered_derivative
+        self.prev_timestamp = timestamp
+        return filtered_value
+
+    def _delta_time(self, timestamp: float | None) -> float:
+        if timestamp is None or self.prev_timestamp is None:
+            return 1.0 / 30.0
+        dt = timestamp - self.prev_timestamp
+        if dt <= 1e-6:
+            return 1.0 / 30.0
+        return dt
+
+    @staticmethod
+    def _alpha(dt: float, cutoff: float) -> float:
+        tau = 1.0 / (2.0 * np.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)

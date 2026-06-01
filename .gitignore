@@ -30,3 +30,7 @@ changelog.md
 
 # 설치 정보
 *.egg-info/
+
+# 벤치마크 데이터
+pushup_videos/
+pushup_videos.zip
