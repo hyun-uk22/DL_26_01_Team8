@@ -1579,7 +1579,6 @@ class PoseCoachApp:
                 break
             frame = cv2.flip(frame, 1)  # 좌우 반전 (거울 모드)
 
-<<<<<<< HEAD
             frame_count += 1
             current_time = time.monotonic()
 
