@@ -56,7 +56,7 @@ pushup_03.mp4,2.0,9.5,bad
 | `dtw_filter` | OFF | ON | ON |
 | `all_enabled` | ON | ON | ON |
 
-10개 영상이면 `10C2 = 45`개 조합이고, 방향을 바꾼 비교까지 수행해 config당 90개 pair row가 생성됩니다.
+15개 영상이면 `15C2 = 105`개 조합이고, 방향을 바꾼 비교까지 수행해 config당 210개 pair row가 생성됩니다.
 
 ## 결과 파일
 

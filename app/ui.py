@@ -1070,8 +1070,17 @@ class PoseCoachApp:
         self.root.after(0, self._finish_recording, output_path)
 
     def _open_camera(self):
-        """Windows에서는 DirectShow가 기본 MSMF보다 첫 프레임 지연이 적은 경우가 많습니다."""
-        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, 0]
+        """플랫폼별 최적 카메라 백엔드를 선택합니다."""
+        import platform
+        system = platform.system()
+
+        if system == "Windows":
+            backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, 0]
+        elif system == "Darwin":  # macOS
+            backends = [cv2.CAP_AVFOUNDATION, 0]
+        else:  # Linux
+            backends = [cv2.CAP_V4L2, 0]
+
         for backend in backends:
             cap = cv2.VideoCapture(0, backend) if backend else cv2.VideoCapture(0)
             if cap.isOpened():
