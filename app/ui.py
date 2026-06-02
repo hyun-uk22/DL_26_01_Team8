@@ -691,8 +691,9 @@ class PoseCoachApp:
         if self.playback_target == "reference" and not self.analysis_playback_frames:
             self.selection_playhead_frame = s
             self._sync_selection_seek_ui()
-        if update_preview:
-            self._schedule_preview_update(s)
+        # 슬라이더 변경 시 프리뷰 업데이트 제거 - 영상이 잘리는 문제 방지
+        # if update_preview:
+        #     self._schedule_preview_update(s)
 
     def _restart_reference_preview_from_range(self, start_frame: int, end_frame: int):
         if self.loader.container is None or end_frame <= start_frame:
