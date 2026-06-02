@@ -550,6 +550,22 @@ class PoseCoachApp:
         )
         self.range_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=10)
 
+        # 시간 표시 레이블 (읽기 전용)
+        time_display_frame = tk.Frame(timeline, bg="#111827")
+        time_display_frame.pack(side=tk.LEFT, padx=(8, 6), pady=10)
+
+        tk.Label(time_display_frame, text="시작:", bg="#111827", fg=muted,
+                 font=("Malgun Gothic", 8)).grid(row=0, column=0, sticky="e", padx=(0, 4))
+        self.crop_start_label = tk.Label(time_display_frame, text="0:00", bg="#111827", fg="#e5e7eb",
+                                         font=("Malgun Gothic", 9), width=8, anchor="w")
+        self.crop_start_label.grid(row=0, column=1, padx=2)
+
+        tk.Label(time_display_frame, text="끝:", bg="#111827", fg=muted,
+                 font=("Malgun Gothic", 8)).grid(row=1, column=0, sticky="e", padx=(0, 4))
+        self.crop_end_label = tk.Label(time_display_frame, text="0:00", bg="#111827", fg="#e5e7eb",
+                                       font=("Malgun Gothic", 9), width=8, anchor="w")
+        self.crop_end_label.grid(row=1, column=1, padx=2)
+
         ttk.Button(
             timeline,
             text="포즈 추출",
@@ -660,6 +676,11 @@ class PoseCoachApp:
         if e <= s:
             self.crop_end_var.set(s + 1)
             e = s + 1
+
+        # 시간 표시 레이블 업데이트
+        self.crop_start_label.config(text=self._format_frame_time(self.loader, s))
+        self.crop_end_label.config(text=self._format_frame_time(self.loader, e))
+
         if was_playing_reference:
             self._restart_reference_preview_from_range(s, e)
             return
