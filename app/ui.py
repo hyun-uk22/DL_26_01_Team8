@@ -668,7 +668,7 @@ class PoseCoachApp:
             self._show_preview_frame(frame)
 
     def _on_time_entry_change(self, event=None):
-        """시간 입력 필드에서 엔터 입력 시 슬라이더 업데이트"""
+        """시간 입력 필드에서 엔터 입력 시 변수만 업데이트 (슬라이더는 유지)"""
         try:
             start_text = self.crop_start_entry.get().strip()
             end_text = self.crop_end_entry.get().strip()
@@ -683,7 +683,8 @@ class PoseCoachApp:
                 end_frame = int(end_seconds * max(self.loader.fps, 1.0))
                 self.crop_end_var.set(max(1, min(end_frame, self._loader_total_frames(self.loader))))
 
-            self._on_slider_change(update_preview=True)
+            # 슬라이더 업데이트 제거 - 변수만 업데이트하고 슬라이더는 유지
+            # self._on_slider_change(update_preview=True)
         except ValueError as e:
             messagebox.showwarning("입력 오류", f"시간 형식이 잘못되었습니다.\n예: 1:30 또는 90\n오류: {e}")
 
