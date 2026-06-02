@@ -550,21 +550,6 @@ class PoseCoachApp:
         )
         self.range_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=10)
 
-        time_input_frame = tk.Frame(timeline, bg="#111827")
-        time_input_frame.pack(side=tk.LEFT, padx=(8, 6), pady=10)
-
-        tk.Label(time_input_frame, text="시작:", bg="#111827", fg=muted,
-                 font=("Malgun Gothic", 8)).grid(row=0, column=0, sticky="e", padx=(0, 2))
-        self.crop_start_entry = ttk.Entry(time_input_frame, width=8, font=("Malgun Gothic", 9))
-        self.crop_start_entry.grid(row=0, column=1, padx=2)
-        self.crop_start_entry.bind("<Return>", self._on_time_entry_change)
-
-        tk.Label(time_input_frame, text="끝:", bg="#111827", fg=muted,
-                 font=("Malgun Gothic", 8)).grid(row=1, column=0, sticky="e", padx=(0, 2))
-        self.crop_end_entry = ttk.Entry(time_input_frame, width=8, font=("Malgun Gothic", 9))
-        self.crop_end_entry.grid(row=1, column=1, padx=2)
-        self.crop_end_entry.bind("<Return>", self._on_time_entry_change)
-
         ttk.Button(
             timeline,
             text="포즈 추출",
@@ -667,44 +652,6 @@ class PoseCoachApp:
         if frame is not None:
             self._show_preview_frame(frame)
 
-    def _on_time_entry_change(self, event=None):
-        """시간 입력 필드에서 엔터 입력 시 변수만 업데이트 (슬라이더는 유지)"""
-        try:
-            start_text = self.crop_start_entry.get().strip()
-            end_text = self.crop_end_entry.get().strip()
-
-            if start_text:
-                start_seconds = self._parse_time_input(start_text)
-                start_frame = int(start_seconds * max(self.loader.fps, 1.0))
-                self.crop_start_var.set(max(0, min(start_frame, self._loader_total_frames(self.loader) - 1)))
-
-            if end_text:
-                end_seconds = self._parse_time_input(end_text)
-                end_frame = int(end_seconds * max(self.loader.fps, 1.0))
-                self.crop_end_var.set(max(1, min(end_frame, self._loader_total_frames(self.loader))))
-
-            # 슬라이더 업데이트 제거 - 변수만 업데이트하고 슬라이더는 유지
-            # self._on_slider_change(update_preview=True)
-        except ValueError as e:
-            messagebox.showwarning("입력 오류", f"시간 형식이 잘못되었습니다.\n예: 1:30 또는 90\n오류: {e}")
-
-    @staticmethod
-    def _parse_time_input(text: str) -> float:
-        """시간 문자열을 초 단위로 변환 (예: '1:30.5' -> 90.5, '45' -> 45.0)"""
-        text = text.strip()
-        if ':' in text:
-            parts = text.split(':')
-            if len(parts) == 2:
-                minutes = float(parts[0])
-                seconds = float(parts[1])
-                return minutes * 60 + seconds
-            elif len(parts) == 3:
-                hours = float(parts[0])
-                minutes = float(parts[1])
-                seconds = float(parts[2])
-                return hours * 3600 + minutes * 60 + seconds
-        return float(text)
-
     def _on_slider_change(self, *_, update_preview: bool = True):
         was_playing_reference = self.is_playing_reference_preview and self.playback_target == "reference"
         self.playback_target = "reference"
@@ -713,12 +660,6 @@ class PoseCoachApp:
         if e <= s:
             self.crop_end_var.set(s + 1)
             e = s + 1
-
-        # Entry 필드 업데이트
-        self.crop_start_entry.delete(0, tk.END)
-        self.crop_start_entry.insert(0, self._format_frame_time(self.loader, s))
-        self.crop_end_entry.delete(0, tk.END)
-        self.crop_end_entry.insert(0, self._format_frame_time(self.loader, e))
         if was_playing_reference:
             self._restart_reference_preview_from_range(s, e)
             return
